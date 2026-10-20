@@ -1,7 +1,10 @@
 name: Bridge
 
 on:
+  # Pull requests run it once; pushes only on the main branches, so a PR
+  # branch is not built twice per commit.
   push:
+    branches: [master, main]
     paths:
       - "bridge/**"
       - ".github/workflows/bridge.yml"
