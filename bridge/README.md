@@ -1,5 +1,7 @@
 # Pulse Bridge
 
+> **Progetto indipendente.** Pulse Bridge non è un prodotto ufficiale di Pulse e non è affiliato a Regncreative né da loro supportato. Per problemi del bridge apri una issue su [inferis995/Pulse](https://github.com/inferis995/Pulse/issues), non sul repository di Pulse. Proposta di collegamento: [Regncreative/Pulse#38](https://github.com/Regncreative/Pulse/issues/38).
+
 Server [MCP](https://modelcontextprotocol.io/) che permette alle app di AI (**OpenCode**, **Claude Desktop**, **Claude Code**, **Cursor**, **VS Code**) di leggere le diagnostiche di [Pulse](../README.md) su un PC Windows.
 
 - **Pulse non viene modificato.** Il bridge si collega a PulseService come client della sua named pipe (`\\.\pipe\PulseService`), esattamente come fa l'app Pulse.
@@ -171,4 +173,4 @@ I test che richiedono PulseService vengono saltati automaticamente quando il ser
 
 ## Licenza
 
-MIT — vedi [LICENSE](LICENSE). Basato su PulseMCP di Regncreative.
+MIT — vedi [LICENSE](LICENSE). Basato su PulseMCP di Regncreative, distribuito con licenza MIT. "Pulse" è il nome del progetto di Regncreative; qui è usato solo per indicare con cosa funziona il bridge.
