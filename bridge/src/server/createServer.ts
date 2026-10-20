@@ -1,0 +1,925 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+
+import {
+  V1_RESOURCES,
+  V1_SUBSCRIPTIONS,
+  V1_TOOLS,
+  V1_TOOL_NAMESPACES,
+} from "../catalog/v1.js";
+import type { DiagnosticsCache } from "../diagnostics/cache.js";
+import {
+  mapDiagnosticsSnapshot,
+  mapServiceStatus,
+} from "../diagnostics/mappers.js";
+import type { HealthCache } from "../health/cache.js";
+import {
+  mapCpu,
+  mapGpu,
+  mapHealth,
+  mapMemory,
+  mapNetwork,
+  mapStorage,
+} from "../health/mappers.js";
+import type { PulseMcpLogger } from "../logging/logger.js";
+import type { MetricsRegistry } from "../metrics/metrics.js";
+import type { McpPolicy } from "../policy/policy.js";
+import type { IpcSession } from "../ipc/session.js";
+import {
+  filterSortProcesses,
+  mapProcessDetails,
+} from "../process/mappers.js";
+import type { TimelineCache } from "../timeline/cache.js";
+import {
+  mapTimelineEvent,
+  parseAccessibleChannels,
+  securityChannelAvailable,
+} from "../timeline/mappers.js";
+import {
+  filterTimelineEvents,
+  type TimelineSearchFilters,
+} from "../timeline/query.js";
+import { runReportExport } from "../report/export.js";
+import { getSharedTempReportStore } from "../report/temp.js";
+import { REPORT_TYPES } from "../report/types.js";
+import { buildMcpStatus, runBridgeStatus } from "../tools/bridgeStatus.js";
+import {
+  presentPayload,
+  runObservationTool,
+  type ToolRuntime,
+} from "../tools/runTool.js";
+import type { PersonalDataRedactor } from "../privacy/redactor.js";
+import { MCP_SERVER_VERSION } from "../version.js";
+import { PulseIpcError } from "../ipc/session.js";
+
+export interface SubscriptionView {
+  current: string[];
+}
+
+export interface CreateServerOptions {
+  metrics: MetricsRegistry;
+  policy: McpPolicy;
+  logger: PulseMcpLogger;
+  session: IpcSession;
+  health: HealthCache;
+  timeline: TimelineCache;
+  diagnostics: DiagnosticsCache;
+  redactor: PersonalDataRedactor;
+  /** Optional live view of active resource subscriptions (for status.json). */
+  subscriptions?: SubscriptionView;
+}
+
+const SYSTEM_URIS = new Set([
+  "pulse://system/cpu",
+  "pulse://system/memory",
+  "pulse://system/gpu",
+  "pulse://system/network",
+  "pulse://system/health",
+]);
+const TIMELINE_LIVE_URI = "pulse://timeline/live";
+const DIAG_SNAPSHOT_URI = "pulse://diagnostics/snapshot";
+const MCP_STATUS_URI = "pulse://bridge/status";
+
+const SYSTEM_RESOURCE_META: Record<
+  string,
+  { name: string; description: string }
+> = {
+  "pulse://system/cpu": {
+    name: "CPU",
+    description: "Latest CPU sample from Pulse Health Engine (~1 Hz when subscribed).",
+  },
+  "pulse://system/memory": {
+    name: "Memory",
+    description: "Latest memory sample from Pulse Health Engine.",
+  },
+  "pulse://system/gpu": {
+    name: "GPU",
+    description: "Latest GPU sample from Pulse Health Engine (primary adapter).",
+  },
+  "pulse://system/network": {
+    name: "Network",
+    description: "Latest network sample from Pulse Health Engine.",
+  },
+  "pulse://system/health": {
+    name: "Health",
+    description: "Full health snapshot (static + sample) from Pulse Health Engine.",
+  },
+  "pulse://timeline/live": {
+    name: "Timeline live",
+    description:
+      "Live TimelineEvent pushes from Pulse Timeline Engine (StartLiveMonitoring).",
+  },
+  "pulse://diagnostics/snapshot": {
+    name: "Diagnostics snapshot",
+    description:
+      "PulseService DiagnosticsSnapshot (on change / ≤5 s while subscribed).",
+  },
+  "pulse://bridge/status": {
+    name: "Bridge status",
+    description:
+      "Pulse Bridge status (versions, compatibility, metrics, capabilities) on metric tick.",
+  },
+};
+
+export function createPulseMcpServer(opts: CreateServerOptions): McpServer {
+  const runtime: ToolRuntime = {
+    metrics: opts.metrics,
+    policy: opts.policy,
+    logger: opts.logger,
+    session: opts.session,
+    health: opts.health,
+    timeline: opts.timeline,
+    diagnostics: opts.diagnostics,
+    redactor: opts.redactor,
+  };
+
+  const server = new McpServer(
+    {
+      name: "pulse-bridge",
+      version: MCP_SERVER_VERSION,
+    },
+    {
+      capabilities: {
+        resources: {
+          subscribe: true,
+          listChanged: true,
+        },
+      },
+    },
+  );
+
+  const subscribed = new Set<string>();
+  const syncSubscriptions = () => {
+    if (opts.subscriptions) {
+      opts.subscriptions.current = [...subscribed];
+    }
+  };
+  let lastPublishedJson = new Map<string, string>();
+
+  const publishIfChanged = async (
+    uri: string,
+    payload: unknown,
+    compareKey?: string,
+  ) => {
+    const key = compareKey ?? JSON.stringify(payload);
+    if (lastPublishedJson.get(uri) === key) return;
+    lastPublishedJson.set(uri, key);
+    try {
+      await server.server.sendResourceUpdated({ uri });
+    } catch {
+      // Client may have disconnected.
+    }
+  };
+
+  /** Exclude wall-clock / latency noise from mcp status change detection. */
+  const mcpStatusCompareKey = (data: Record<string, unknown>): string => {
+    const {
+      observedAt: _o,
+      uptimeSeconds: _u,
+      diagnostics,
+      ...rest
+    } = data;
+    const diag = (diagnostics ?? {}) as Record<string, unknown>;
+    const { ipcLatencyMs: _l, ...diagRest } = diag;
+    return JSON.stringify({ ...rest, diagnostics: diagRest });
+  };
+
+  const onHealthSample = () => {
+    void (async () => {
+      if (subscribed.size === 0) return;
+      try {
+        const snap = await opts.health.ensureSnapshot();
+        if (subscribed.has("pulse://system/cpu")) {
+          await publishIfChanged(
+            "pulse://system/cpu",
+            mapCpu(snap.sample, snap.info),
+          );
+        }
+        if (subscribed.has("pulse://system/memory")) {
+          await publishIfChanged(
+            "pulse://system/memory",
+            mapMemory(snap.sample, snap.info),
+          );
+        }
+        if (subscribed.has("pulse://system/gpu")) {
+          await publishIfChanged(
+            "pulse://system/gpu",
+            mapGpu(snap.sample, snap.info),
+          );
+        }
+        if (subscribed.has("pulse://system/network")) {
+          await publishIfChanged(
+            "pulse://system/network",
+            mapNetwork(snap.sample, snap.info),
+          );
+        }
+        if (subscribed.has("pulse://system/health")) {
+          await publishIfChanged("pulse://system/health", mapHealth(snap));
+        }
+      } catch (err) {
+        opts.logger.warn("resource.publish_fail", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+  };
+
+  opts.health.onSample(onHealthSample);
+
+  server.registerTool(
+    "bridge_status",
+    {
+      title: "Pulse Bridge status",
+      description:
+        "Returns Pulse Bridge and PulseService versions, whether this Pulse version is tested with the bridge, whether personal data is masked, tool capabilities and connection health. Call it first when other tools fail. Structured JSON only.",
+      inputSchema: z.object({}),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () =>
+      runBridgeStatus({
+        redactor: opts.redactor,
+        metrics: opts.metrics,
+        policy: opts.policy,
+        logPath: opts.logger.logPath,
+        transport: "stdio",
+        session: opts.session,
+        activeSubscriptions: [...subscribed],
+      }),
+  );
+
+  const systemTool = (
+    name: (typeof V1_TOOLS)[number],
+    title: string,
+    description: string,
+    inputSchema: z.ZodTypeAny,
+    handler: (args: Record<string, unknown>) => Promise<unknown>,
+  ) => {
+    server.registerTool(
+      name,
+      {
+        title,
+        description,
+        inputSchema,
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async (args) =>
+        runObservationTool(runtime, name, () =>
+          handler((args ?? {}) as Record<string, unknown>),
+        ),
+    );
+  };
+
+  systemTool(
+    "system_health",
+    "System health snapshot",
+    "Full or sectioned health snapshot from Pulse Health Engine (GetHealthSnapshot / cached HealthUpdate). Null when unsupported. Structured JSON only.",
+    z.object({
+      sections: z
+        .array(
+          z.enum(["cpu", "memory", "gpu", "storage", "network", "static"]),
+        )
+        .optional(),
+      forceRefresh: z.boolean().optional(),
+    }),
+    async (args) => {
+      const snap = await opts.health.ensureSnapshot(
+        args.forceRefresh === true,
+      );
+      return mapHealth(snap, args.sections as string[] | undefined);
+    },
+  );
+
+  systemTool(
+    "system_cpu",
+    "CPU metrics",
+    "Latest CPU utilization and topology from Pulse Health Engine cache/snapshot. Structured JSON only.",
+    z.object({ forceRefresh: z.boolean().optional() }),
+    async (args) => {
+      const snap = await opts.health.ensureSnapshot(
+        args.forceRefresh === true,
+      );
+      return mapCpu(snap.sample, snap.info);
+    },
+  );
+
+  systemTool(
+    "system_memory",
+    "Memory metrics",
+    "Latest memory metrics from Pulse Health Engine. Structured JSON only.",
+    z.object({ forceRefresh: z.boolean().optional() }),
+    async (args) => {
+      const snap = await opts.health.ensureSnapshot(
+        args.forceRefresh === true,
+      );
+      return mapMemory(snap.sample, snap.info);
+    },
+  );
+
+  systemTool(
+    "system_gpu",
+    "GPU metrics",
+    "Latest GPU metrics for the primary adapter from Pulse Health Engine. Structured JSON only.",
+    z.object({ forceRefresh: z.boolean().optional() }),
+    async (args) => {
+      const snap = await opts.health.ensureSnapshot(
+        args.forceRefresh === true,
+      );
+      return mapGpu(snap.sample, snap.info);
+    },
+  );
+
+  systemTool(
+    "system_storage",
+    "Storage metrics",
+    "Volumes, physical disk throughput, and storage summary from Pulse Health Engine. Structured JSON only.",
+    z.object({ forceRefresh: z.boolean().optional() }),
+    async (args) => {
+      const snap = await opts.health.ensureSnapshot(
+        args.forceRefresh === true,
+      );
+      return mapStorage(snap.sample, snap.info);
+    },
+  );
+
+  systemTool(
+    "system_network",
+    "Network metrics",
+    "Latest network rates and addressing from Pulse Health Engine. Structured JSON only.",
+    z.object({ forceRefresh: z.boolean().optional() }),
+    async (args) => {
+      const snap = await opts.health.ensureSnapshot(
+        args.forceRefresh === true,
+      );
+      return mapNetwork(snap.sample, snap.info);
+    },
+  );
+
+  const processFilterSchema = z.object({
+    cpuAbove: z.number().optional(),
+    memoryAboveBytes: z.number().optional(),
+    company: z.string().optional(),
+    signed: z.boolean().optional(),
+    running: z.boolean().optional(),
+    applicationOnly: z.boolean().optional(),
+    backgroundOnly: z.boolean().optional(),
+    systemOnly: z.boolean().optional(),
+    nameContains: z.string().optional(),
+    limit: z.number().int().min(1).max(500).optional(),
+    offset: z.number().int().min(0).optional(),
+    sortBy: z.enum(["cpu", "memory", "name", "pid"]).optional(),
+    sortDir: z.enum(["asc", "desc"]).optional(),
+  });
+
+  systemTool(
+    "process_list",
+    "Process inventory",
+    "Filtered process inventory from Pulse Health Engine process stream. Structured JSON only.",
+    processFilterSchema,
+    async (args) => {
+      return opts.health.withInventory(async () => {
+        const observedAt = new Date().toISOString();
+        const result = filterSortProcesses(
+          opts.health.listProcesses(),
+          args as Parameters<typeof filterSortProcesses>[1],
+        );
+        return {
+          observedAt,
+          ...result,
+        };
+      });
+    },
+  );
+
+  systemTool(
+    "process_search",
+    "Process search",
+    "Search process inventory by name/path (required query). Same filters as process_list. Structured JSON only.",
+    processFilterSchema.extend({
+      query: z.string().min(1),
+    }),
+    async (args) => {
+      const query = String((args as { query?: string }).query ?? "").trim();
+      if (!query) {
+        throw new PulseIpcError("query is required", "INVALID_ARGUMENT");
+      }
+      return opts.health.withInventory(async () => {
+        const observedAt = new Date().toISOString();
+        const result = filterSortProcesses(opts.health.listProcesses(), {
+          ...(args as Parameters<typeof filterSortProcesses>[1]),
+          query,
+        });
+        return {
+          observedAt,
+          query,
+          ...result,
+        };
+      });
+    },
+  );
+
+  systemTool(
+    "process_details",
+    "Process details",
+    "Detailed process metadata via GetProcessDetails (cmdline redacted). Structured JSON only.",
+    z.object({
+      pid: z.number().int().positive(),
+    }),
+    async (args) => {
+      const pid = Number((args as { pid: number }).pid);
+      if (!Number.isInteger(pid) || pid <= 0) {
+        throw new PulseIpcError(
+          "pid must be a positive integer",
+          "INVALID_ARGUMENT",
+        );
+      }
+      return opts.health.withInventory(async () => {
+        const details = await opts.health.getProcessDetails(pid);
+        const live = opts.health.getProcess(pid);
+        const mapped = mapProcessDetails(details, live);
+        return {
+          observedAt: new Date().toISOString(),
+          ...mapped,
+        };
+      });
+    },
+  );
+
+  const enrichRaw = async (
+    events: import("../timeline/types.js").TimelineEvent[],
+    includeRaw: boolean,
+  ) => {
+    if (!includeRaw) {
+      return events.map((e) => mapTimelineEvent(e, { includeRaw: false }));
+    }
+    const out: Record<string, unknown>[] = [];
+    for (const e of events) {
+      let full = e;
+      if (e.channel && e.recordId > 0 && !e.rawXml) {
+        try {
+          const detail = await opts.timeline.getEventDetail(
+            e.channel,
+            e.recordId,
+          );
+          if (detail) full = detail;
+        } catch {
+          // Keep list row without rawXml.
+        }
+      }
+      out.push(mapTimelineEvent(full, { includeRaw: true }));
+    }
+    return out;
+  };
+
+  const runTimelineQuery = async (
+    filters: TimelineSearchFilters & { channelIpc?: string },
+  ) => {
+    const ipcChannel = filters.channelIpc ?? "System";
+    if (
+      ipcChannel.toLowerCase() === "security" ||
+      filters.channel === "security"
+    ) {
+      // Explicit Security intent: try Security-only snapshot first.
+      try {
+        const secSnap = await opts.timeline.getSnapshot({
+          limit: Math.min(filters.limit ?? 100, 500),
+          channel: "Security",
+        });
+        const filtered = filterTimelineEvents(secSnap.events, filters);
+        const limit = Math.min(Math.max(1, filters.limit ?? 50), 500);
+        const offset = Math.max(0, filters.offset ?? 0);
+        const page = filtered.slice(offset, offset + limit);
+        const events = await enrichRaw(page, filters.includeRaw === true);
+        return {
+          observedAt: new Date().toISOString(),
+          count: events.length,
+          truncated: offset + events.length < filtered.length,
+          channels: parseAccessibleChannels(secSnap.channel),
+          securityChannelAvailable: true,
+          includeRaw: filters.includeRaw === true,
+          events,
+        };
+      } catch (err) {
+        if (err instanceof PulseIpcError && err.code === "ACCESS_DENIED") {
+          throw err;
+        }
+        throw new PulseIpcError(
+          "Security Event Log is not accessible under the PulseService account",
+          "ACCESS_DENIED",
+        );
+      }
+    }
+
+    const snap = await opts.timeline.getSnapshot({
+      limit: 500,
+      channel: ipcChannel,
+    });
+    const securityAvailable = securityChannelAvailable(snap.channel);
+    const filtered = filterTimelineEvents(snap.events, filters);
+    const limit = Math.min(Math.max(1, filters.limit ?? 50), 500);
+    const offset = Math.max(0, filters.offset ?? 0);
+    const page = filtered.slice(offset, offset + limit);
+    const events = await enrichRaw(page, filters.includeRaw === true);
+    return {
+      observedAt: new Date().toISOString(),
+      count: events.length,
+      truncated: offset + events.length < filtered.length,
+      channels: parseAccessibleChannels(snap.channel),
+      securityChannelAvailable: securityAvailable,
+      includeRaw: filters.includeRaw === true,
+      events,
+    };
+  };
+
+  systemTool(
+    "timeline_list",
+    "Timeline event list",
+    "Historical Timeline snapshot from Pulse Timeline Engine (GetTimelineSnapshot). Structured JSON only. Raw XML only when includeRaw=true.",
+    z.object({
+      limit: z.number().int().min(1).max(500).optional(),
+      cursor: z.string().optional(),
+      offset: z.number().int().min(0).optional(),
+      includeRaw: z.boolean().optional(),
+      channel: z
+        .enum(["system", "application", "security", "other"])
+        .optional(),
+    }),
+    async (args) => {
+      const a = args as {
+        limit?: number;
+        cursor?: string;
+        offset?: number;
+        includeRaw?: boolean;
+        channel?: TimelineSearchFilters["channel"];
+      };
+      const offset =
+        a.offset ??
+        (a.cursor && /^\d+$/.test(a.cursor) ? Number(a.cursor) : 0);
+      return runTimelineQuery({
+        limit: a.limit ?? 50,
+        offset,
+        includeRaw: a.includeRaw === true,
+        channel: a.channel,
+      });
+    },
+  );
+
+  systemTool(
+    "timeline_search",
+    "Timeline search",
+    "Filter Timeline snapshot client-side (Flutter TimelineQuery semantics). Structured JSON only. Raw XML only when includeRaw=true.",
+    z.object({
+      severity: z
+        .array(
+          z.enum([
+            "info",
+            "warning",
+            "error",
+            "critical",
+            "verbose",
+            "unknown",
+          ]),
+        )
+        .optional(),
+      category: z.string().optional(),
+      process: z.string().optional(),
+      provider: z.string().optional(),
+      eventId: z.number().int().optional(),
+      keyword: z.string().optional(),
+      from: z.string().optional(),
+      to: z.string().optional(),
+      channel: z
+        .enum(["system", "application", "security", "other"])
+        .optional(),
+      computer: z.string().optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+      offset: z.number().int().min(0).optional(),
+      includeRaw: z.boolean().optional(),
+    }),
+    async (args) => {
+      return runTimelineQuery(args as TimelineSearchFilters);
+    },
+  );
+
+  systemTool(
+    "diagnostics_snapshot",
+    "Diagnostics snapshot",
+    "PulseService DiagnosticsSnapshot via GetDiagnosticsSnapshot. Structured JSON only.",
+    z.object({ forceRefresh: z.boolean().optional() }),
+    async (args) => {
+      const snap = await opts.diagnostics.ensureSnapshot(
+        (args as { forceRefresh?: boolean }).forceRefresh === true,
+      );
+      return mapDiagnosticsSnapshot(snap);
+    },
+  );
+
+  systemTool(
+    "service_status",
+    "PulseService status",
+    "PulseService SCM/identity subset from DiagnosticsSnapshot. Not the full Windows Services catalog. Structured JSON only.",
+    z.object({ forceRefresh: z.boolean().optional() }),
+    async (args) => {
+      const snap = await opts.diagnostics.ensureSnapshot(
+        (args as { forceRefresh?: boolean }).forceRefresh === true,
+      );
+      return mapServiceStatus(snap);
+    },
+  );
+
+  server.registerTool(
+    "report_export",
+    {
+      title: "Export Pulse report",
+      description:
+        "Generate a Pulse report file from PulseService snapshots (mirrors the Pulse app ReportExporter). Personal data in the file is not masked. Returns metadata only — never report body. Formats: json, csv, html, pdf, markdown. sideEffects: write_user_export_dir.",
+      inputSchema: z.object({
+        // Validated in handler for INVALID_REPORT_TYPE / INVALID_FORMAT codes.
+        reportType: z.string().optional(),
+        template: z.string().optional(),
+        format: z.string(),
+        outputPath: z.string().optional(),
+        directory: z.string().optional(),
+        filters: z
+          .object({
+            limit: z.number().int().min(1).max(2000).optional(),
+            channel: z
+              .enum(["system", "application", "security", "other"])
+              .optional(),
+            severity: z.array(z.string()).optional(),
+            keyword: z.string().optional(),
+            from: z.string().optional(),
+            to: z.string().optional(),
+          })
+          .optional(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (args) =>
+      runObservationTool(runtime, "report_export", async () => {
+        const a = (args ?? {}) as {
+          reportType?: string;
+          template?: string;
+          format?: string;
+          outputPath?: string;
+          directory?: string;
+          filters?: Record<string, unknown>;
+        };
+        if (!a.reportType && !a.template) {
+          const { ReportExportError } = await import("../report/errors.js");
+          throw new ReportExportError(
+            "INVALID_REPORT_TYPE",
+            "reportType or template is required",
+            { supported: [...REPORT_TYPES] },
+          );
+        }
+        return runReportExport(
+          {
+            session: opts.session,
+            health: opts.health,
+            timeline: opts.timeline,
+            diagnostics: opts.diagnostics,
+          },
+          {
+            reportType: a.reportType,
+            template: a.template,
+            format: a.format,
+            outputPath: a.outputPath,
+            directory: a.directory,
+            filters: a.filters as import("../report/types.js").ReportFilters,
+          },
+          getSharedTempReportStore(),
+        );
+      }),
+  );
+
+  opts.timeline.onLiveEvent((event) => {
+    if (!subscribed.has(TIMELINE_LIVE_URI)) return;
+    void publishIfChanged(TIMELINE_LIVE_URI, mapTimelineEvent(event));
+  });
+
+  opts.diagnostics.onChange((snap) => {
+    if (!subscribed.has(DIAG_SNAPSHOT_URI)) return;
+    void publishIfChanged(DIAG_SNAPSHOT_URI, mapDiagnosticsSnapshot(snap));
+  });
+
+  let mcpStatusTimer: NodeJS.Timeout | null = null;
+  const tickMcpStatus = () => {
+    void (async () => {
+      if (!subscribed.has(MCP_STATUS_URI) || !opts.policy.enabled) return;
+      try {
+        const { data } = await buildMcpStatus({
+          metrics: opts.metrics,
+          policy: opts.policy,
+          logPath: opts.logger.logPath,
+          transport: "stdio",
+          session: opts.session,
+          activeSubscriptions: [...subscribed],
+        });
+        await publishIfChanged(
+          MCP_STATUS_URI,
+          data,
+          mcpStatusCompareKey(data),
+        );
+      } catch (err) {
+        opts.logger.warn("resource.publish_fail", {
+          uri: MCP_STATUS_URI,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+  };
+
+  for (const uri of V1_RESOURCES) {
+    const meta = SYSTEM_RESOURCE_META[uri]!;
+    server.registerResource(
+      meta.name,
+      uri,
+      {
+        description: meta.description,
+        mimeType: "application/json",
+      },
+      async () => {
+        if (!opts.policy.enabled) {
+          return {
+            contents: [
+              {
+                uri,
+                mimeType: "application/json",
+                text: JSON.stringify({
+                  ok: false,
+                  code: "POLICY_DISABLED",
+                  message: "Pulse Bridge is disabled",
+                }),
+              },
+            ],
+          };
+        }
+        if (uri === TIMELINE_LIVE_URI) {
+          const recent = opts.timeline.recentLiveEvents(1);
+          const payload =
+            recent.length > 0
+              ? mapTimelineEvent(recent[recent.length - 1]!)
+              : {
+                  observedAt: new Date().toISOString(),
+                  note: "No live timeline events received yet. Subscribe to receive pushes.",
+                };
+          return {
+            contents: [
+              {
+                uri,
+                mimeType: "application/json",
+                text: JSON.stringify(presentPayload(runtime, payload)),
+              },
+            ],
+          };
+        }
+        if (uri === DIAG_SNAPSHOT_URI) {
+          const dsnap = await opts.diagnostics.ensureSnapshot();
+          return {
+            contents: [
+              {
+                uri,
+                mimeType: "application/json",
+                text: JSON.stringify(presentPayload(runtime, mapDiagnosticsSnapshot(dsnap))),
+              },
+            ],
+          };
+        }
+        if (uri === MCP_STATUS_URI) {
+          const { data } = await buildMcpStatus({
+            metrics: opts.metrics,
+            policy: opts.policy,
+            logPath: opts.logger.logPath,
+            transport: "stdio",
+            session: opts.session,
+            activeSubscriptions: [...subscribed],
+          });
+          return {
+            contents: [
+              {
+                uri,
+                mimeType: "application/json",
+                text: JSON.stringify(presentPayload(runtime, data)),
+              },
+            ],
+          };
+        }
+        const snap = await opts.health.ensureSnapshot();
+        let payload: unknown;
+        switch (uri) {
+          case "pulse://system/cpu":
+            payload = mapCpu(snap.sample, snap.info);
+            break;
+          case "pulse://system/memory":
+            payload = mapMemory(snap.sample, snap.info);
+            break;
+          case "pulse://system/gpu":
+            payload = mapGpu(snap.sample, snap.info);
+            break;
+          case "pulse://system/network":
+            payload = mapNetwork(snap.sample, snap.info);
+            break;
+          default:
+            payload = mapHealth(snap);
+        }
+        return {
+          contents: [
+            {
+              uri,
+              mimeType: "application/json",
+              text: JSON.stringify(presentPayload(runtime, payload)),
+            },
+          ],
+        };
+      },
+    );
+  }
+
+  server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+    const uri = request.params.uri;
+    if (!(V1_SUBSCRIPTIONS as readonly string[]).includes(uri)) {
+      throw new Error(`NOT_SUPPORTED: resource ${uri}`);
+    }
+    if (!opts.policy.enabled) {
+      throw new Error("POLICY_DISABLED");
+    }
+    const already = subscribed.has(uri);
+    subscribed.add(uri);
+    syncSubscriptions();
+    if (SYSTEM_URIS.has(uri) && !already) {
+      const systemCount = [...subscribed].filter((u) => SYSTEM_URIS.has(u))
+        .length;
+      if (systemCount === 1) {
+        await opts.health.addSubscriber();
+      }
+    }
+    if (uri === TIMELINE_LIVE_URI && !already) {
+      await opts.timeline.addLiveSubscriber();
+    }
+    if (uri === DIAG_SNAPSHOT_URI && !already) {
+      await opts.diagnostics.addPollSubscriber();
+    }
+    if (uri === MCP_STATUS_URI && !already) {
+      if (!mcpStatusTimer) {
+        mcpStatusTimer = setInterval(tickMcpStatus, 2000);
+      }
+      tickMcpStatus();
+    }
+    opts.logger.info("resource.subscribe", { uri, count: subscribed.size });
+    lastPublishedJson.delete(uri);
+    if (SYSTEM_URIS.has(uri)) onHealthSample();
+    return {};
+  });
+
+  server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+    const uri = request.params.uri;
+    if (!subscribed.delete(uri)) {
+      return {};
+    }
+    syncSubscriptions();
+    if (SYSTEM_URIS.has(uri)) {
+      const systemCount = [...subscribed].filter((u) => SYSTEM_URIS.has(u))
+        .length;
+      if (systemCount === 0) {
+        await opts.health.removeSubscriber();
+      }
+    }
+    if (uri === TIMELINE_LIVE_URI) {
+      await opts.timeline.removeLiveSubscriber();
+    }
+    if (uri === DIAG_SNAPSHOT_URI) {
+      await opts.diagnostics.removePollSubscriber();
+    }
+    if (uri === MCP_STATUS_URI && !subscribed.has(MCP_STATUS_URI)) {
+      if (mcpStatusTimer) {
+        clearInterval(mcpStatusTimer);
+        mcpStatusTimer = null;
+      }
+    }
+    if (subscribed.size === 0) lastPublishedJson.clear();
+    opts.logger.info("resource.unsubscribe", { uri, count: subscribed.size });
+    return {};
+  });
+
+  void V1_TOOL_NAMESPACES;
+  return server;
+}

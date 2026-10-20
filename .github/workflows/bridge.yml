@@ -1,0 +1,62 @@
+name: Bridge
+
+on:
+  # Pull requests run it once; pushes only on the main branches, so a PR
+  # branch is not built twice per commit.
+  push:
+    branches: [master, main]
+    paths:
+      - "bridge/**"
+      - ".github/workflows/bridge.yml"
+  pull_request:
+    paths:
+      - "bridge/**"
+      - ".github/workflows/bridge.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: bridge
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: CLI smoke test
+        run: |
+          node dist/main.js --version
+          node dist/main.js --print-config opencode
+
+      - name: Package
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          npm prune --omit=dev
+          $out = "pulse-bridge"
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Copy-Item -Recurse dist, node_modules, skill -Destination $out
+          Copy-Item package.json, README.md, LICENSE -Destination $out
+      - name: Upload package
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulse-bridge-windows
+          path: bridge/pulse-bridge
+          retention-days: 30
